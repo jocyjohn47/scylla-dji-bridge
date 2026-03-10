@@ -181,7 +181,7 @@ app.post('/admin/config', (req, res) => {
 });
 
 // ── Admin UI ────────────────────────────────────────────────────
-app.get('/admin', (_, res) => {
+app.get('/admin', (req, res) => {
   const tokenOK = !!cfg.DJI_X_USER_TOKEN && cfg.DJI_X_USER_TOKEN !== 'YOUR_SECRET_TOKEN';
   const scyllaOK = !!cfg.SCYLLA_PUSH_TOKEN && cfg.SCYLLA_PUSH_TOKEN !== 'your_scylla_push_token_here';
   res.setHeader('Content-Type', 'text/html');
