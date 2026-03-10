@@ -443,3 +443,53 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+
+// ── DIAGNOSTIC: Query DJI FH2 to find correct workflow + project UUIDs ──────
+app.get('/diagnostic', async (req, res) => {
+  const axios = require('axios');
+  const token = cfg.DJI_X_USER_TOKEN;
+  const projUuid = cfg.DJI_X_PROJECT_UUID;
+  const base = cfg.DJI_FH2_ENDPOINT;
+
+  if (!token || token === 'YOUR_SECRET_TOKEN') {
+    return res.status(400).json({ error: 'DJI_X_USER_TOKEN not set. Please configure it in /admin first.' });
+  }
+
+  const report = { token_preview: token.slice(0,12)+'...', project_uuid_in_config: projUuid, results: {} };
+
+  // 1. List all projects in org
+  try {
+    const projResp = await axios.get(`${base}/openapi/v0.1/workspaces`, {
+      headers: { 'X-User-Token': token, 'Content-Type': 'application/json' },
+      timeout: 8000
+    });
+    report.results.projects = projResp.data;
+  } catch(e) {
+    report.results.projects_error = { status: e.response?.status, data: e.response?.data, msg: e.message };
+  }
+
+  // 2. List workflows in the configured project
+  try {
+    const wfResp = await axios.get(`${base}/openapi/v0.1/workflows`, {
+      headers: { 'X-User-Token': token, 'x-project-uuid': projUuid, 'Content-Type': 'application/json' },
+      timeout: 8000
+    });
+    report.results.workflows_in_project = wfResp.data;
+  } catch(e) {
+    report.results.workflows_error = { status: e.response?.status, data: e.response?.data, msg: e.message };
+  }
+
+  // 3. Try triggered workflow list
+  try {
+    const trigResp = await axios.get(`${base}/openapi/v0.1/workflows?type=triggered`, {
+      headers: { 'X-User-Token': token, 'x-project-uuid': projUuid, 'Content-Type': 'application/json' },
+      timeout: 8000
+    });
+    report.results.triggered_workflows = trigResp.data;
+  } catch(e) {
+    report.results.triggered_workflows_error = { status: e.response?.status, data: e.response?.data, msg: e.message };
+  }
+
+  addLog('CFG', 'Diagnostic ran', null);
+  return res.json(report);
+});
