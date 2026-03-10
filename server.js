@@ -442,6 +442,29 @@ app.listen(PORT, () => {
   console.log(`🩺 Health        : GET  http://localhost:${PORT}/health\n`);
 });
 
+
+// ── Keep-Alive: Self-ping every 14 min to prevent Render free-tier sleep ──
+(function startKeepAlive() {
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || ('http://localhost:' + PORT);
+  const INTERVAL = 14 * 60 * 1000; // 14 minutes
+
+  function ping() {
+    const mod = SELF_URL.startsWith('https') ? require('https') : require('http');
+    mod.get(SELF_URL + '/health', (r) => {
+      console.log('[keep-alive] ✅ ping OK ' + new Date().toISOString() + ' (' + r.statusCode + ')');
+    }).on('error', (e) => {
+      console.log('[keep-alive] ⚠️  ping fail: ' + e.message);
+    });
+  }
+
+  // First ping after 3-min warm-up, then every 14 min
+  setTimeout(() => {
+    ping();
+    setInterval(ping, INTERVAL);
+    console.log('[keep-alive] 🔄 Keep-alive active — pinging ' + SELF_URL + '/health every 14 min');
+  }, 3 * 60 * 1000);
+})();
+
 module.exports = app;
 
 // ── DIAGNOSTIC: Query DJI FH2 to find correct workflow + project UUIDs ──────
