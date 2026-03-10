@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: scylla-dji-bridge
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: SCYLLA_PUSH_TOKEN
+        sync: false
+      - key: DJI_X_USER_TOKEN
+        sync: false
+      - key: DJI_X_PROJECT_UUID
+        value: b8cf4c12-0e36-4603-82df-c4660ce770be
+      - key: DJI_WORKFLOW_UUID
+        value: 047beaa8-103e-4e49-9371-c54c253d555e
+      - key: DJI_CREATOR_ID
+        value: "1847118310561013760"
+      - key: DJI_FH2_ENDPOINT
+        value: https://es-flight-api-us.djigate.com
+      - key: DJI_FH2_PATH
+        value: /openapi/v0.1/workflow
+      - key: AUTO_TRIGGER_LEVEL
+        value: "3"
+      - key: DEFAULT_LATITUDE
+        value: "22.793234156"
+      - key: DEFAULT_LONGITUDE
+        value: "114.258620618"
+      - key: ADMIN_PASSWORD
+        value: admin1234
