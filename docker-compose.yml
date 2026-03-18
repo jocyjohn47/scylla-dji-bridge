@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  dji-bridge:
+    build: .
+    container_name: dji-fh2-bridge
+    restart: always
+    network_mode: host
+    volumes:
+      - ./config.json:/app/config.json
+      - ./logs:/app/logs
+    environment:
+      - PORT=4000

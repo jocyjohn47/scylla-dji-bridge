@@ -1,429 +1,619 @@
-// ================================================================
-// server.js  —  Scylla.ai ↔ DJI FlightHub 2 Middleware Bridge v1.1
-// ================================================================
 'use strict';
 require('dotenv').config();
+
 const express    = require('express');
+const axios      = require('axios');
 const helmet     = require('helmet');
 const cors       = require('cors');
-const morgan     = require('morgan');
 const rateLimit  = require('express-rate-limit');
 const { transform, buildDJIHeaders } = require('./transformer');
-const { triggerWorkflow }            = require('./djiClient');
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
-// ── In-memory config (survives restarts via .env, editable via /admin) ──
-const cfg = {
-  SCYLLA_PUSH_TOKEN  : process.env.SCYLLA_PUSH_TOKEN   || '',
-  DJI_X_USER_TOKEN   : process.env.DJI_X_USER_TOKEN    || '',
-  DJI_X_PROJECT_UUID : process.env.DJI_X_PROJECT_UUID  || 'b8cf4c12-0e36-4603-82df-c4660ce770be',
-  DJI_WORKFLOW_UUID  : process.env.DJI_WORKFLOW_UUID    || '047beaa8-103e-4e49-9371-c54c253d555e',
-  DJI_CREATOR_ID     : process.env.DJI_CREATOR_ID       || '1847118310561013760',
-  DJI_FH2_ENDPOINT   : process.env.DJI_FH2_ENDPOINT    || 'https://es-flight-api-us.djigate.com',
-  DJI_FH2_PATH       : process.env.DJI_FH2_PATH         || '/openapi/v0.1/workflow',
-  AUTO_TRIGGER_LEVEL : parseInt(process.env.AUTO_TRIGGER_LEVEL || '3', 10),
-  DEFAULT_LATITUDE   : parseFloat(process.env.DEFAULT_LATITUDE  || '22.793234156'),
-  DEFAULT_LONGITUDE  : parseFloat(process.env.DEFAULT_LONGITUDE || '114.258620618'),
-  ADMIN_PASSWORD     : process.env.ADMIN_PASSWORD || 'admin1234',
+// ── Config Store (in-memory, persisted to config.json) ───────────────────────
+const fs   = require('fs');
+const path = require('path');
+const CFG_FILE = path.join(__dirname, 'config.json');
+
+// Default empty config — admin fills everything via UI
+const DEFAULT_CFG = {
+  // DJI FlightHub 2
+  DJI_FH2_ENDPOINT:   '',
+  DJI_FH2_PATH:       '/openapi/v0.1/workflow',
+  DJI_X_USER_TOKEN:   '',
+  DJI_X_PROJECT_UUID: '',
+  DJI_WORKFLOW_UUID:  '',
+  DJI_CREATOR_ID:     '',
+  // Source Platform (Scylla / any)
+  SCYLLA_PUSH_TOKEN:  '',
+  SOURCE_PLATFORM:    'scylla',
+  // Bridge Defaults
+  PORT:               '4000',
+  ADMIN_PASSWORD:     'admin1234',
+  AUTO_TRIGGER_LEVEL: '3',
+  DEFAULT_LATITUDE:   '',
+  DEFAULT_LONGITUDE:  '',
 };
 
-// sync cfg back to process.env so transformer.js picks them up
-function syncEnv() {
-  Object.entries(cfg).forEach(([k, v]) => { process.env[k] = String(v); });
+function loadCfg() {
+  // Priority: config.json → env vars → defaults
+  let saved = {};
+  try {
+    if (fs.existsSync(CFG_FILE)) {
+      saved = JSON.parse(fs.readFileSync(CFG_FILE, 'utf8'));
+    }
+  } catch(e) {}
+  const merged = { ...DEFAULT_CFG };
+  // Apply env vars
+  for (const key of Object.keys(DEFAULT_CFG)) {
+    if (process.env[key]) merged[key] = process.env[key];
+  }
+  // Apply saved config (highest priority)
+  for (const key of Object.keys(saved)) {
+    if (saved[key] !== '') merged[key] = saved[key];
+  }
+  return merged;
 }
-syncEnv();
 
-// ── Middleware ──────────────────────────────────────────────────
-app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(cors());
-app.use(express.json());
-app.use(morgan('tiny'));
+function saveCfg(updates) {
+  let existing = {};
+  try {
+    if (fs.existsSync(CFG_FILE)) existing = JSON.parse(fs.readFileSync(CFG_FILE, 'utf8'));
+  } catch(e) {}
+  const merged = { ...existing, ...updates };
+  fs.writeFileSync(CFG_FILE, JSON.stringify(merged, null, 2));
+  return merged;
+}
 
-const webhookLimiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true });
+let cfg = loadCfg();
 
-// ── Log store (last 50) ─────────────────────────────────────────
+// ── Logs ─────────────────────────────────────────────────────────────────────
 const logs = [];
 function addLog(type, msg, data) {
   const entry = { time: new Date().toISOString(), type, msg, data: data || null };
   logs.unshift(entry);
-  if (logs.length > 50) logs.pop();
+  if (logs.length > 200) logs.pop();
+  console.log(`[${type}] ${msg}`, data ? JSON.stringify(data).slice(0,120) : '');
 }
 
-// ════════════════════════════════════════════════════════════════
-//  ROUTES
-// ════════════════════════════════════════════════════════════════
+// ── Middleware ────────────────────────────────────────────────────────────────
+app.set('trust proxy', 1);
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
 
-// ── Health ──────────────────────────────────────────────────────
-app.get('/health', (_, res) => {
+const webhookLimiter = rateLimit({ windowMs: 60_000, max: 60 });
+
+// ── Helper: is bridge configured? ────────────────────────────────────────────
+function isConfigured() {
+  return !!(cfg.DJI_FH2_ENDPOINT && cfg.DJI_X_USER_TOKEN && cfg.DJI_X_PROJECT_UUID &&
+            cfg.DJI_WORKFLOW_UUID && cfg.SCYLLA_PUSH_TOKEN);
+}
+
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
   res.json({
-    status : 'ok',
-    service: 'Scylla → DJI FH2 Bridge v1.1',
-    uptime : Math.floor(process.uptime()) + 's',
-    configured: {
-      DJI_X_USER_TOKEN  : !!cfg.DJI_X_USER_TOKEN && cfg.DJI_X_USER_TOKEN !== 'YOUR_SECRET_TOKEN',
+    status:     'ok',
+    service:    'Universal DJI FH2 Bridge v2.0',
+    uptime:     Math.floor(process.uptime()) + 's',
+    configured: isConfigured(),
+    setup_url:  `${req.protocol}://${req.get('host')}/admin`,
+    fields: {
+      DJI_FH2_ENDPOINT:   !!cfg.DJI_FH2_ENDPOINT,
+      DJI_X_USER_TOKEN:   !!cfg.DJI_X_USER_TOKEN,
       DJI_X_PROJECT_UUID: !!cfg.DJI_X_PROJECT_UUID,
-      DJI_WORKFLOW_UUID : !!cfg.DJI_WORKFLOW_UUID,
-      SCYLLA_PUSH_TOKEN : !!cfg.SCYLLA_PUSH_TOKEN && cfg.SCYLLA_PUSH_TOKEN !== 'your_scylla_push_token_here',
+      DJI_WORKFLOW_UUID:  !!cfg.DJI_WORKFLOW_UUID,
+      DJI_CREATOR_ID:     !!cfg.DJI_CREATOR_ID,
+      SCYLLA_PUSH_TOKEN:  !!cfg.SCYLLA_PUSH_TOKEN,
     }
   });
 });
 
-// ── Config read ─────────────────────────────────────────────────
-app.get('/config', (_, res) => {
+// ── Config API ────────────────────────────────────────────────────────────────
+app.get('/config', (req, res) => {
+  // Return safe config (no secrets)
   res.json({
-    dji: {
-      project_uuid : cfg.DJI_X_PROJECT_UUID,
-      workflow_uuid: cfg.DJI_WORKFLOW_UUID,
-      creator_id   : cfg.DJI_CREATOR_ID,
-      endpoint     : cfg.DJI_FH2_ENDPOINT + cfg.DJI_FH2_PATH,
-      token_set    : !!cfg.DJI_X_USER_TOKEN && cfg.DJI_X_USER_TOKEN !== 'YOUR_SECRET_TOKEN',
-    },
-    scylla: { token_set: !!cfg.SCYLLA_PUSH_TOKEN && cfg.SCYLLA_PUSH_TOKEN !== 'your_scylla_push_token_here' },
-    auto_trigger_level: cfg.AUTO_TRIGGER_LEVEL,
-    default_gps: { latitude: cfg.DEFAULT_LATITUDE, longitude: cfg.DEFAULT_LONGITUDE },
+    DJI_FH2_ENDPOINT:   cfg.DJI_FH2_ENDPOINT,
+    DJI_FH2_PATH:       cfg.DJI_FH2_PATH,
+    DJI_X_PROJECT_UUID: cfg.DJI_X_PROJECT_UUID,
+    DJI_WORKFLOW_UUID:  cfg.DJI_WORKFLOW_UUID,
+    DJI_CREATOR_ID:     cfg.DJI_CREATOR_ID,
+    SOURCE_PLATFORM:    cfg.SOURCE_PLATFORM,
+    AUTO_TRIGGER_LEVEL: cfg.AUTO_TRIGGER_LEVEL,
+    DEFAULT_LATITUDE:   cfg.DEFAULT_LATITUDE,
+    DEFAULT_LONGITUDE:  cfg.DEFAULT_LONGITUDE,
+    configured:         isConfigured(),
   });
 });
 
-// ── Scylla Webhook ──────────────────────────────────────────────
+// ── Webhook (main entry point) ────────────────────────────────────────────────
 app.post('/webhook/scylla', webhookLimiter, async (req, res) => {
-  // 1. Validate Bearer token
-  const auth = req.headers['authorization'] || '';
+  // Auth check
+  const auth  = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  if (!cfg.SCYLLA_PUSH_TOKEN || cfg.SCYLLA_PUSH_TOKEN === 'your_scylla_push_token_here') {
-    addLog('WARN', 'SCYLLA_PUSH_TOKEN not configured — accepting all');
-  } else if (token !== cfg.SCYLLA_PUSH_TOKEN) {
-    addLog('WARN', 'Rejected webhook — bad token', { receivedToken: token.slice(0,8)+'...' });
-    return res.status(401).json({ error: 'Invalid Scylla push token' });
+  if (cfg.SCYLLA_PUSH_TOKEN && token !== cfg.SCYLLA_PUSH_TOKEN) {
+    addLog('WARN', 'Rejected — bad token', { received: token.slice(0,8) });
+    return res.status(401).json({ error: 'Invalid push token' });
+  }
+  if (!isConfigured()) {
+    addLog('WARN', 'Bridge not configured yet');
+    return res.status(503).json({
+      error:    'Bridge not configured',
+      setup:    'Please complete setup at /admin',
+      missing:  Object.entries({
+        DJI_FH2_ENDPOINT:   cfg.DJI_FH2_ENDPOINT,
+        DJI_X_USER_TOKEN:   cfg.DJI_X_USER_TOKEN,
+        DJI_X_PROJECT_UUID: cfg.DJI_X_PROJECT_UUID,
+        DJI_WORKFLOW_UUID:  cfg.DJI_WORKFLOW_UUID,
+        SCYLLA_PUSH_TOKEN:  cfg.SCYLLA_PUSH_TOKEN,
+      }).filter(([,v]) => !v).map(([k]) => k)
+    });
   }
 
-  // 2. Transform
   const payload = req.body;
-  const { djiBody, level } = transform(payload);
+  const { djiBody, level, latitude, longitude, alertLabel } = transform(payload, cfg);
 
-  addLog('IN', `Scylla alert received — level ${level}`, {
-    alertLabel : payload.alert?.label || 'unknown',
-    camera     : payload.camera_name || 'N/A',
-    coordinates: { lat: djiBody.params.latitude, lng: djiBody.params.longitude },
+  addLog('IN', `Alert received — level ${level}`, {
+    alertLabel,
+    camera: payload.camera_id || payload.camera_name || 'N/A',
+    coordinates: { lat: latitude, lng: longitude }
   });
 
-  // 3. Check threshold
-  if (level < cfg.AUTO_TRIGGER_LEVEL) {
-    addLog('SKIP', `Level ${level} below threshold ${cfg.AUTO_TRIGGER_LEVEL} — no dispatch`);
-    return res.json({ status: 'skipped', reason: `level ${level} < threshold ${cfg.AUTO_TRIGGER_LEVEL}`, level });
-  }
-
-  // 4. Forward to DJI FH2
   try {
-    const headers = buildDJIHeaders();
-    const djiResp = await triggerWorkflow(headers, djiBody);
-    addLog('OUT', `DJI FH2 dispatch OK — level ${level}`, { djiBody, djiResp });
-    return res.json({ status: 'dispatched', level, djiBody, djiResponse: djiResp });
-  } catch (err) {
-    const errData = { message: err.message, status: err.response?.status, data: err.response?.data };
-    addLog('ERR', 'DJI FH2 call failed', errData);
-    return res.status(502).json({ status: 'error', error: 'DJI FH2 call failed', detail: errData });
+    const url  = `${cfg.DJI_FH2_ENDPOINT}${cfg.DJI_FH2_PATH}`;
+    const hdrs = buildDJIHeaders(cfg);
+    const resp = await axios.post(url, djiBody, { headers: hdrs, timeout: 10000 });
+
+    addLog('OUT', `DJI dispatch OK — level ${level}`, {
+      djiBody,
+      djiResp: resp.data
+    });
+
+    return res.json({
+      status:      'dispatched',
+      level,
+      djiBody,
+      djiResponse: resp.data
+    });
+  } catch(err) {
+    const errData = {
+      message: err.message,
+      status:  err.response?.status,
+      data:    err.response?.data
+    };
+    addLog('ERR', 'DJI dispatch failed', errData);
+    return res.status(502).json({ error: 'DJI dispatch failed', details: errData });
   }
 });
 
-// ── Test trigger ────────────────────────────────────────────────
-app.post('/test/trigger', async (req, res) => {
-  const { latitude, longitude, level = 5, description = 'Manual test dispatch' } = req.body;
-  const mockPayload = {
-    location: {
-      latitude : latitude  || cfg.DEFAULT_LATITUDE,
-      longitude: longitude || cfg.DEFAULT_LONGITUDE,
-    },
-    alert      : { label: 'test_dispatch', severity: level },
-    description,
-  };
-  const { djiBody } = transform(mockPayload);
+// Also accept generic webhook path
+app.post('/webhook', webhookLimiter, (req, res, next) => {
+  req.url = '/webhook/scylla';
+  next('route');
+});
+
+// ── Logs API ──────────────────────────────────────────────────────────────────
+app.get('/logs', (req, res) => {
+  res.json({ count: logs.length, logs: logs.slice(0, 100) });
+});
+
+// ── Admin API: Save Config ─────────────────────────────────────────────────────
+app.post('/api/config', (req, res) => {
+  const { password, ...updates } = req.body;
+  if (password !== cfg.ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Wrong admin password' });
+  }
+  // Only save known fields
+  const allowed = Object.keys(DEFAULT_CFG);
+  const clean   = {};
+  for (const k of allowed) {
+    if (updates[k] !== undefined && updates[k] !== '') clean[k] = updates[k];
+  }
+  saveCfg(clean);
+  cfg = loadCfg();
+  addLog('CFG', 'Config updated via admin', { fields: Object.keys(clean) });
+  return res.json({ success: true, configured: isConfigured() });
+});
+
+// ── Admin: Test DJI Connection ────────────────────────────────────────────────
+app.post('/api/test-dji', async (req, res) => {
+  const { password } = req.body;
+  if (password !== cfg.ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
+  if (!cfg.DJI_FH2_ENDPOINT || !cfg.DJI_X_USER_TOKEN) {
+    return res.status(400).json({ error: 'DJI endpoint and token required first' });
+  }
   try {
-    const headers  = buildDJIHeaders();
-    const djiResp  = await triggerWorkflow(headers, djiBody);
-    addLog('TEST', 'Manual test dispatch sent', { djiBody, djiResp });
-    return res.json({ status: 'ok', djiBody, djiResponse: djiResp });
-  } catch (err) {
-    const errData = { message: err.message, status: err.response?.status, data: err.response?.data };
-    addLog('ERR', 'Test dispatch failed', errData);
-    return res.status(502).json({ status: 'error', detail: errData });
+    const url  = `${cfg.DJI_FH2_ENDPOINT}${cfg.DJI_FH2_PATH}`;
+    const hdrs = buildDJIHeaders(cfg);
+    const body = {
+      workflow_uuid: cfg.DJI_WORKFLOW_UUID,
+      trigger_type:  0,
+      name:          `bridge-test-${Date.now()}`,
+      params: {
+        creator:   cfg.DJI_CREATOR_ID,
+        latitude:  parseFloat(cfg.DEFAULT_LATITUDE)  || 25.12489,
+        longitude: parseFloat(cfg.DEFAULT_LONGITUDE) || 55.38150,
+        level:     parseInt(cfg.AUTO_TRIGGER_LEVEL)  || 3,
+        desc:      'Bridge connection test'
+      }
+    };
+    const resp = await axios.post(url, body, { headers: hdrs, timeout: 10000 });
+    addLog('TEST', 'DJI test dispatch', { resp: resp.data });
+    return res.json({ success: true, djiResponse: resp.data });
+  } catch(err) {
+    return res.status(502).json({
+      success: false,
+      error:   err.message,
+      status:  err.response?.status,
+      data:    err.response?.data
+    });
   }
 });
 
-// ── Recent logs ─────────────────────────────────────────────────
-app.get('/logs', (_, res) => res.json({ count: logs.length, logs }));
-
-// ── Config update API ───────────────────────────────────────────
-app.post('/admin/config', (req, res) => {
-  const { adminPassword, ...newCfg } = req.body;
-  if (adminPassword !== cfg.ADMIN_PASSWORD) {
-    return res.status(403).json({ error: 'Wrong admin password' });
+// ── Admin: Test Webhook ────────────────────────────────────────────────────────
+app.post('/api/test-webhook', async (req, res) => {
+  const { password } = req.body;
+  if (password !== cfg.ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
+  // Simulate a Scylla alert
+  try {
+    const host     = `${req.protocol}://${req.get('host')}`;
+    const testBody = {
+      alert:       { label: 'intrusion', severity: 3 },
+      camera_id:   'test-cam-01',
+      camera_name: 'Test Camera',
+      location:    { latitude: parseFloat(cfg.DEFAULT_LATITUDE) || 25.12489, longitude: parseFloat(cfg.DEFAULT_LONGITUDE) || 55.38150 },
+      description: 'Bridge self-test alert',
+      timestamp:   new Date().toISOString()
+    };
+    const resp = await axios.post(`${host}/webhook/scylla`, testBody, {
+      headers: { 'Authorization': `Bearer ${cfg.SCYLLA_PUSH_TOKEN}`, 'Content-Type': 'application/json' },
+      timeout: 15000
+    });
+    return res.json({ success: true, result: resp.data });
+  } catch(err) {
+    return res.status(502).json({
+      success: false,
+      error:   err.message,
+      data:    err.response?.data
+    });
   }
-  const allowed = [
-    'SCYLLA_PUSH_TOKEN','DJI_X_USER_TOKEN','DJI_X_PROJECT_UUID',
-    'DJI_WORKFLOW_UUID','DJI_CREATOR_ID','DJI_FH2_ENDPOINT','DJI_FH2_PATH',
-    'AUTO_TRIGGER_LEVEL','DEFAULT_LATITUDE','DEFAULT_LONGITUDE','ADMIN_PASSWORD'
-  ];
-  let updated = [];
-  for (const key of allowed) {
-    if (newCfg[key] !== undefined && newCfg[key] !== '') {
-      cfg[key] = key === 'AUTO_TRIGGER_LEVEL' ? parseInt(newCfg[key], 10)
-               : (key === 'DEFAULT_LATITUDE' || key === 'DEFAULT_LONGITUDE') ? parseFloat(newCfg[key])
-               : newCfg[key];
-      updated.push(key);
-    }
-  }
-  syncEnv();
-  addLog('CFG', `Config updated: ${updated.join(', ')}`);
-  return res.json({ status: 'ok', updated });
 });
 
-// ── Admin UI ────────────────────────────────────────────────────
+// ── Admin UI ──────────────────────────────────────────────────────────────────
 app.get('/admin', (req, res) => {
-  const tokenOK = !!cfg.DJI_X_USER_TOKEN && cfg.DJI_X_USER_TOKEN !== 'YOUR_SECRET_TOKEN';
-  const scyllaOK = !!cfg.SCYLLA_PUSH_TOKEN && cfg.SCYLLA_PUSH_TOKEN !== 'your_scylla_push_token_here';
   res.setHeader('Content-Type', 'text/html');
+  const configured = isConfigured();
+  const statusColor = configured ? '#48bb78' : '#f6ad55';
+  const statusText  = configured ? '✅ CONFIGURED & READY' : '⚠️ SETUP REQUIRED';
+
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>Bridge Admin — Scylla.ai ↔ DJI FH2</title>
+<title>DJI FH2 Bridge — Admin</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Segoe UI',Arial,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
-  .topbar{background:linear-gradient(135deg,#1a1f2e,#0d1b2a);padding:20px 32px;border-bottom:2px solid #2d3748;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
-  .topbar h1{font-size:22px;font-weight:800;color:#fff}
-  .topbar span{font-size:13px;color:#94a3b8}
-  .status-bar{display:flex;gap:10px;padding:14px 32px;background:#141824;border-bottom:1px solid #2d3748;flex-wrap:wrap}
-  .badge{display:inline-flex;align-items:center;gap:6px;padding:5px 14px;border-radius:20px;font-size:13px;font-weight:700}
-  .badge.ok{background:#1a3a2a;color:#68d391;border:1px solid #276749}
-  .badge.warn{background:#3b2800;color:#f6ad55;border:1px solid #d69e2e}
-  .container{max-width:900px;margin:0 auto;padding:28px 24px}
-  .card{background:#1a2035;border:1px solid #2d3748;border-radius:14px;padding:24px;margin-bottom:22px}
-  .card h2{font-size:16px;font-weight:700;color:#63b3ed;margin-bottom:18px;display:flex;align-items:center;gap:8px}
-  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  @media(max-width:600px){.form-grid{grid-template-columns:1fr}}
-  .field{display:flex;flex-direction:column;gap:6px}
-  .field label{font-size:12px;font-weight:700;color:#a0aec0;text-transform:uppercase;letter-spacing:.5px}
-  .field input,.field select{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 14px;color:#e2e8f0;font-size:14px;outline:none;transition:border .2s}
-  .field input:focus,.field select:focus{border-color:#3182ce}
-  .field .hint{font-size:11px;color:#718096}
-  .field .required{color:#fc8181}
-  .btn{padding:12px 24px;border-radius:10px;font-size:14px;font-weight:700;border:none;cursor:pointer;transition:all .2s}
-  .btn-primary{background:#3182ce;color:#fff}
-  .btn-primary:hover{background:#2b6cb0}
-  .btn-green{background:#276749;color:#9ae6b4}
-  .btn-green:hover{background:#22543d}
-  .btn-red{background:#c53030;color:#fed7d7}
-  .btn-red:hover{background:#9b2c2c}
-  .btn-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}
-  #msg{margin-top:14px;padding:12px 16px;border-radius:8px;font-size:14px;display:none}
-  #msg.ok{background:#1a3a2a;border:1px solid #276749;color:#68d391}
-  #msg.err{background:#3b1818;border:1px solid #c53030;color:#fc8181}
-  .log-box{background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:14px;height:220px;overflow-y:auto;font-family:monospace;font-size:12px}
-  .log-entry{padding:4px 0;border-bottom:1px solid #1a2035}
-  .log-entry .time{color:#718096}
-  .log-entry .type-IN{color:#63b3ed}
-  .log-entry .type-OUT{color:#68d391}
-  .log-entry .type-ERR{color:#fc8181}
-  .log-entry .type-WARN{color:#f6ad55}
-  .log-entry .type-SKIP{color:#a0aec0}
-  .log-entry .type-TEST{color:#b794f4}
-  .log-entry .type-CFG{color:#fbd38d}
-  .url-box{background:#0d1117;border:1px solid #2b6cb0;border-radius:8px;padding:10px 14px;font-family:monospace;font-size:13px;color:#63b3ed;word-break:break-all;margin:8px 0}
-  .section-divider{height:1px;background:#2d3748;margin:8px 0 16px}
-  .fullwidth{grid-column:1/-1}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+.topbar{background:linear-gradient(135deg,#1a1f2e,#2d3748);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2d3748}
+.topbar h1{font-size:18px;font-weight:700;color:#63b3ed}
+.topbar h1 span{color:#68d391;font-size:13px;margin-left:8px}
+.status-bar{background:#1a1f2e;padding:10px 24px;border-bottom:1px solid #2d3748;display:flex;align-items:center;gap:12px}
+.status-dot{width:10px;height:10px;border-radius:50%;background:${statusColor};box-shadow:0 0 6px ${statusColor}}
+.status-text{font-size:13px;font-weight:600;color:${statusColor}}
+.container{max-width:900px;margin:0 auto;padding:24px}
+.card{background:#1a1f2e;border-radius:12px;padding:24px;margin-bottom:20px;border:1px solid #2d3748}
+.card h2{font-size:15px;font-weight:700;color:#90cdf4;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.card h2 .badge{font-size:11px;background:#2d3748;padding:2px 8px;border-radius:20px;color:#a0aec0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:12px;color:#a0aec0;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.field input,.field select{background:#0f1117;border:1px solid #4a5568;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:13px;width:100%;transition:border .2s}
+.field input:focus,.field select:focus{outline:none;border-color:#63b3ed}
+.field input.filled{border-color:#48bb78}
+.field input.empty{border-color:#fc8181}
+.hint{font-size:11px;color:#718096;margin-top:3px}
+.full{grid-column:1/-1}
+.btn-row{display:flex;gap:10px;margin-top:6px;flex-wrap:wrap}
+.btn{padding:10px 20px;border-radius:8px;border:none;cursor:pointer;font-size:13px;font-weight:600;transition:all .2s}
+.btn-primary{background:#3182ce;color:#fff}.btn-primary:hover{background:#2b6cb0}
+.btn-success{background:#38a169;color:#fff}.btn-success:hover{background:#2f855a}
+.btn-warning{background:#d69e2e;color:#fff}.btn-warning:hover{background:#b7791f}
+.btn-danger{background:#e53e3e;color:#fff}.btn-danger:hover{background:#c53030}
+.btn-gray{background:#2d3748;color:#e2e8f0}.btn-gray:hover{background:#4a5568}
+#msg{margin-top:12px;padding:10px 14px;border-radius:8px;font-size:13px;display:none}
+#msg.ok{display:block;background:#1c4532;color:#68d391;border:1px solid #2f855a}
+#msg.err{display:block;background:#742a2a;color:#fc8181;border:1px solid #c53030}
+.url-box{background:#0f1117;border:1px solid #2d3748;border-radius:6px;padding:8px 12px;font-family:monospace;font-size:12px;color:#63b3ed;word-break:break-all;margin-top:6px}
+.log-box{background:#0f1117;border-radius:8px;padding:12px;max-height:280px;overflow-y:auto;font-family:monospace;font-size:11px}
+.log-IN{color:#68d391}.log-OUT{color:#63b3ed}.log-ERR{color:#fc8181}.log-WARN{color:#f6ad55}.log-CFG{color:#b794f4}.log-TEST{color:#76e4f7}
+.section-title{font-size:13px;color:#718096;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #2d3748}
+.setup-steps{counter-reset:step}
+.step{display:flex;gap:12px;margin-bottom:14px;align-items:flex-start}
+.step-num{background:#3182ce;color:#fff;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;margin-top:2px}
+.step-content{flex:1}
+.step-title{font-size:13px;font-weight:600;color:#e2e8f0}
+.step-desc{font-size:12px;color:#718096;margin-top:2px}
 </style>
 </head>
 <body>
 <div class="topbar">
-  <div>
-    <h1>⚙️ Bridge Admin — Scylla.ai ↔ DJI FlightHub 2</h1>
-    <span>Live config editor • No restart needed</span>
-  </div>
-  <div style="display:flex;gap:8px;align-items:center">
-    <span style="font-size:12px;color:#718096">Bridge URL:</span>
-    <span style="font-family:monospace;font-size:12px;color:#63b3ed">${req.protocol}://${req.get('host')}</span>
-  </div>
+  <h1>🚁 DJI FlightHub 2 Bridge <span>v2.0 Universal</span></h1>
+  <div style="font-size:12px;color:#718096">Admin Panel</div>
 </div>
 <div class="status-bar">
-  <span class="badge ${tokenOK ? 'ok' : 'warn'}">${tokenOK ? '✅' : '⚠️'} DJI X-User-Token ${tokenOK ? 'SET' : 'MISSING'}</span>
-  <span class="badge ${scyllaOK ? 'ok' : 'warn'}">${scyllaOK ? '✅' : '⚠️'} Scylla Push Token ${scyllaOK ? 'SET' : 'MISSING'}</span>
-  <span class="badge ok">🔗 Project UUID: ${cfg.DJI_X_PROJECT_UUID.slice(0,8)}...</span>
-  <span class="badge ok">🚁 Workflow UUID: ${cfg.DJI_WORKFLOW_UUID.slice(0,8)}...</span>
-  <span class="badge ok">📡 Trigger Level: ≥${cfg.AUTO_TRIGGER_LEVEL}</span>
+  <div class="status-dot"></div>
+  <div class="status-text">${statusText}</div>
+  <div style="margin-left:auto;font-size:12px;color:#718096">Port: ${PORT}</div>
 </div>
 
 <div class="container">
 
-  <!-- Webhook URL box -->
+  ${!configured ? `
+  <div class="card" style="border-color:#d69e2e">
+    <h2>🚀 Quick Setup Guide</h2>
+    <div class="setup-steps">
+      <div class="step"><div class="step-num">1</div><div class="step-content"><div class="step-title">Get DJI FH2 Endpoint</div><div class="step-desc">Your FH2 server URL e.g. https://83.111.79.70:30812 or https://es-flight-api-us.djigate.com</div></div></div>
+      <div class="step"><div class="step-num">2</div><div class="step-content"><div class="step-title">Get Organisation Key</div><div class="step-desc">FH2 Dashboard → My Organization → Settings → FlightHub Sync → Copy Organization Key</div></div></div>
+      <div class="step"><div class="step-num">3</div><div class="step-content"><div class="step-title">Get Project UUID & Workflow UUID</div><div class="step-desc">FH2 Dashboard → Your Project → Automation → Triggered Workflow → Select workflow → Copy IDs</div></div></div>
+      <div class="step"><div class="step-num">4</div><div class="step-content"><div class="step-title">Set Scylla Push Token</div><div class="step-desc">Choose any secret password — you'll enter same value in Scylla webhook config</div></div></div>
+      <div class="step"><div class="step-num">5</div><div class="step-content"><div class="step-title">Fill form below → Save → Test</div><div class="step-desc">Click "Test DJI Connection" to verify before going live</div></div></div>
+    </div>
+  </div>` : ''}
+
+  <!-- CONFIGURATION FORM -->
   <div class="card">
-    <h2>📡 Your Webhook URLs (paste these into Scylla.ai)</h2>
-    <div style="font-size:13px;color:#94a3b8;margin-bottom:8px">Scylla HTTP Endpoint → URL field:</div>
-    <div class="url-box">${req.protocol}://${req.get('host')}/webhook/scylla</div>
-    <div style="font-size:13px;color:#94a3b8;margin:12px 0 8px">Health check:</div>
-    <div class="url-box">${req.protocol}://${req.get('host')}/health</div>
-    <div style="font-size:13px;color:#94a3b8;margin:12px 0 8px">Recent logs:</div>
-    <div class="url-box">${req.protocol}://${req.get('host')}/logs</div>
+    <h2>⚙️ Configuration <span class="badge">All fields saved permanently to disk</span></h2>
+
+    <div class="section-title">🔒 Admin Access</div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="field">
+        <label>Admin Password</label>
+        <input type="password" id="ADMIN_PASSWORD" value="${cfg.ADMIN_PASSWORD}" placeholder="admin1234"/>
+        <div class="hint">Password to access this admin panel</div>
+      </div>
+      <div class="field">
+        <label>Current Password (required to save)</label>
+        <input type="password" id="currentPassword" placeholder="Enter current admin password"/>
+      </div>
+    </div>
+
+    <div class="section-title">🌐 DJI FlightHub 2 Server</div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="field full">
+        <label>DJI FH2 Endpoint URL ⭐</label>
+        <input type="text" id="DJI_FH2_ENDPOINT" value="${cfg.DJI_FH2_ENDPOINT}"
+          placeholder="e.g. https://83.111.79.70:30812  OR  https://es-flight-api-us.djigate.com"
+          class="${cfg.DJI_FH2_ENDPOINT ? 'filled' : 'empty'}"/>
+        <div class="hint">Your FH2 server IP/domain + port. On-prem: use your server IP. Cloud: use djigate.com URL</div>
+      </div>
+      <div class="field">
+        <label>API Path</label>
+        <input type="text" id="DJI_FH2_PATH" value="${cfg.DJI_FH2_PATH || '/openapi/v0.1/workflow'}"
+          placeholder="/openapi/v0.1/workflow"/>
+        <div class="hint">Usually /openapi/v0.1/workflow — don't change unless DJI says so</div>
+      </div>
+      <div class="field">
+        <label>Source Platform</label>
+        <select id="SOURCE_PLATFORM">
+          <option value="scylla" ${cfg.SOURCE_PLATFORM==='scylla'?'selected':''}>Scylla.ai</option>
+          <option value="generic" ${cfg.SOURCE_PLATFORM==='generic'?'selected':''}>Generic / Other</option>
+          <option value="avigilon" ${cfg.SOURCE_PLATFORM==='avigilon'?'selected':''}>Avigilon</option>
+          <option value="milestone" ${cfg.SOURCE_PLATFORM==='milestone'?'selected':''}>Milestone</option>
+        </select>
+        <div class="hint">Your camera AI platform sending alerts</div>
+      </div>
+    </div>
+
+    <div class="section-title">🔑 DJI Authentication</div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="field full">
+        <label>DJI Organisation Key (X-User-Token) ⭐</label>
+        <input type="password" id="DJI_X_USER_TOKEN" value="${cfg.DJI_X_USER_TOKEN}"
+          placeholder="eyJhbGci... (JWT token from FlightHub Sync)"
+          class="${cfg.DJI_X_USER_TOKEN ? 'filled' : 'empty'}"/>
+        <div class="hint">FH2 → My Organization → Settings → FlightHub Sync → Organization Key</div>
+      </div>
+      <div class="field">
+        <label>Project UUID ⭐</label>
+        <input type="text" id="DJI_X_PROJECT_UUID" value="${cfg.DJI_X_PROJECT_UUID}"
+          placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+          class="${cfg.DJI_X_PROJECT_UUID ? 'filled' : 'empty'}"/>
+        <div class="hint">From FH2 project URL or Auto Trigger page</div>
+      </div>
+      <div class="field">
+        <label>Workflow UUID ⭐</label>
+        <input type="text" id="DJI_WORKFLOW_UUID" value="${cfg.DJI_WORKFLOW_UUID}"
+          placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+          class="${cfg.DJI_WORKFLOW_UUID ? 'filled' : 'empty'}"/>
+        <div class="hint">From FH2 → Automation → Triggered Workflow → workflow_uuid</div>
+      </div>
+      <div class="field">
+        <label>Creator ID</label>
+        <input type="text" id="DJI_CREATOR_ID" value="${cfg.DJI_CREATOR_ID}"
+          placeholder="e.g. 1847118310561013760"
+          class="${cfg.DJI_CREATOR_ID ? 'filled' : 'empty'}"/>
+        <div class="hint">User ID from JWT token (auto-extracted if left blank)</div>
+      </div>
+    </div>
+
+    <div class="section-title">📡 Source Platform (Scylla / Camera AI)</div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="field">
+        <label>Push Token (Bearer) ⭐</label>
+        <input type="text" id="SCYLLA_PUSH_TOKEN" value="${cfg.SCYLLA_PUSH_TOKEN}"
+          placeholder="e.g. mysecrettoken123"
+          class="${cfg.SCYLLA_PUSH_TOKEN ? 'filled' : 'empty'}"/>
+        <div class="hint">Secret password — same value goes in Scylla webhook Bearer token field</div>
+      </div>
+    </div>
+
+    <div class="section-title">📍 Default Settings</div>
+    <div class="grid" style="margin-bottom:16px">
+      <div class="field">
+        <label>Default Latitude</label>
+        <input type="text" id="DEFAULT_LATITUDE" value="${cfg.DEFAULT_LATITUDE}"
+          placeholder="e.g. 25.12489"/>
+        <div class="hint">Used when alert has no GPS coords</div>
+      </div>
+      <div class="field">
+        <label>Default Longitude</label>
+        <input type="text" id="DEFAULT_LONGITUDE" value="${cfg.DEFAULT_LONGITUDE}"
+          placeholder="e.g. 55.38150"/>
+        <div class="hint">Used when alert has no GPS coords</div>
+      </div>
+      <div class="field">
+        <label>Default Alert Level (1-5)</label>
+        <select id="AUTO_TRIGGER_LEVEL">
+          <option value="1" ${cfg.AUTO_TRIGGER_LEVEL==='1'?'selected':''}>1 - Very Low</option>
+          <option value="2" ${cfg.AUTO_TRIGGER_LEVEL==='2'?'selected':''}>2 - Low</option>
+          <option value="3" ${cfg.AUTO_TRIGGER_LEVEL==='3'?'selected':''}>3 - Medium</option>
+          <option value="4" ${cfg.AUTO_TRIGGER_LEVEL==='4'?'selected':''}>4 - High</option>
+          <option value="5" ${cfg.AUTO_TRIGGER_LEVEL==='5'?'selected':''}>5 - Critical</option>
+        </select>
+        <div class="hint">Fallback level when alert type can't be mapped</div>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveConfig()">💾 Save Configuration</button>
+      <button class="btn btn-success" onclick="testDJI()">🔌 Test DJI Connection</button>
+      <button class="btn btn-warning" onclick="testWebhook()">📡 Test Full Webhook</button>
+      <button class="btn btn-gray" onclick="loadLogs()">🔄 Refresh Logs</button>
+    </div>
+    <div id="msg"></div>
   </div>
 
-  <!-- Config Form -->
+  <!-- WEBHOOK INFO -->
   <div class="card">
-    <h2>✏️ Edit Configuration</h2>
-    <form id="cfgForm">
-      <div class="form-grid">
-
-        <div class="field fullwidth">
-          <label>🔐 Admin Password <span class="required">*required to save</span></label>
-          <input type="password" id="adminPassword" placeholder="Enter admin password" autocomplete="off"/>
-          <span class="hint">Default password: admin1234 (change it after first login)</span>
-        </div>
-
-        <div class="section-divider fullwidth"></div>
-        <div class="fullwidth" style="color:#63b3ed;font-size:13px;font-weight:700;margin-bottom:4px">── Scylla.ai Settings ──</div>
-
-        <div class="field fullwidth">
-          <label>🔑 Scylla Push Token <span class="required">*</span></label>
-          <input type="text" id="SCYLLA_PUSH_TOKEN" placeholder="e.g. my_secret_scylla_token_2024" value="${cfg.SCYLLA_PUSH_TOKEN !== 'your_scylla_push_token_here' ? cfg.SCYLLA_PUSH_TOKEN : ''}"/>
-          <span class="hint">You invent this value — paste the same value into Scylla.ai → Create HTTP Endpoint → Push Token</span>
-        </div>
-
-        <div class="section-divider fullwidth"></div>
-        <div class="fullwidth" style="color:#68d391;font-size:13px;font-weight:700;margin-bottom:4px">── DJI FlightHub 2 Settings ──</div>
-
-        <div class="field fullwidth">
-          <label>🚁 DJI X-User-Token (Organization Key) <span class="required">*MOST IMPORTANT</span></label>
-          <input type="text" id="DJI_X_USER_TOKEN" placeholder="64-character hex key from FH2 → My Org → Settings → FlightHub Sync → Org Key" value="${cfg.DJI_X_USER_TOKEN !== 'YOUR_SECRET_TOKEN' ? cfg.DJI_X_USER_TOKEN : ''}"/>
-          <span class="hint">📍 Where to find: Login fh.dji.com → top-right avatar → My Organization → ⚙️ gear icon → FlightHub Sync tab → Organization Key (copy full key)</span>
-        </div>
-
-        <div class="field">
-          <label>🗂️ DJI Project UUID</label>
-          <input type="text" id="DJI_X_PROJECT_UUID" value="${cfg.DJI_X_PROJECT_UUID}"/>
-          <span class="hint">Pre-filled from your FH2 settings ✓</span>
-        </div>
-
-        <div class="field">
-          <label>⚡ Workflow UUID</label>
-          <input type="text" id="DJI_WORKFLOW_UUID" value="${cfg.DJI_WORKFLOW_UUID}"/>
-          <span class="hint">Pre-filled from your FH2 settings ✓</span>
-        </div>
-
-        <div class="field">
-          <label>👤 Creator ID</label>
-          <input type="text" id="DJI_CREATOR_ID" value="${cfg.DJI_CREATOR_ID}"/>
-        </div>
-
-        <div class="field">
-          <label>🌍 DJI FH2 Server Region</label>
-          <select id="DJI_FH2_ENDPOINT">
-            <option value="https://es-flight-api-us.djigate.com" ${cfg.DJI_FH2_ENDPOINT.includes('us') ? 'selected' : ''}>🌎 International (US)</option>
-            <option value="https://es-flight-api-eu.djigate.com" ${cfg.DJI_FH2_ENDPOINT.includes('eu') ? 'selected' : ''}>🌍 European (EU)</option>
-          </select>
-        </div>
-
-        <div class="section-divider fullwidth"></div>
-        <div class="fullwidth" style="color:#f6ad55;font-size:13px;font-weight:700;margin-bottom:4px">── Trigger Settings ──</div>
-
-        <div class="field">
-          <label>📊 Auto-Dispatch Level Threshold</label>
-          <select id="AUTO_TRIGGER_LEVEL">
-            <option value="1" ${cfg.AUTO_TRIGGER_LEVEL===1?'selected':''}>1 — All alerts (dispatch everything)</option>
-            <option value="2" ${cfg.AUTO_TRIGGER_LEVEL===2?'selected':''}>2 — Low and above</option>
-            <option value="3" ${cfg.AUTO_TRIGGER_LEVEL===3?'selected':''}>3 — Medium and above (recommended)</option>
-            <option value="4" ${cfg.AUTO_TRIGGER_LEVEL===4?'selected':''}>4 — High and above</option>
-            <option value="5" ${cfg.AUTO_TRIGGER_LEVEL===5?'selected':''}>5 — Critical only</option>
-          </select>
-          <span class="hint">Alerts below this level will be logged but won't dispatch a drone</span>
-        </div>
-
-        <div class="field">
-          <label>📍 Default GPS — Latitude</label>
-          <input type="number" step="any" id="DEFAULT_LATITUDE" value="${cfg.DEFAULT_LATITUDE}"/>
-          <span class="hint">Used when Scylla alert has no GPS coordinates</span>
-        </div>
-
-        <div class="field">
-          <label>📍 Default GPS — Longitude</label>
-          <input type="number" step="any" id="DEFAULT_LONGITUDE" value="${cfg.DEFAULT_LONGITUDE}"/>
-        </div>
-
-        <div class="field fullwidth">
-          <label>🔐 New Admin Password (optional — leave blank to keep current)</label>
-          <input type="password" id="ADMIN_PASSWORD" placeholder="Leave blank to keep current password"/>
-        </div>
-
+    <h2>📡 Webhook Endpoints</h2>
+    <div class="grid">
+      <div class="field">
+        <label>Scylla / Camera AI Webhook URL</label>
+        <div class="url-box" id="webhookUrl">Loading...</div>
+        <div class="hint">Paste this URL in your camera AI platform webhook config</div>
       </div>
-
-      <div id="msg"></div>
-      <div class="btn-row">
-        <button type="button" class="btn btn-primary" onclick="saveConfig()">💾 Save & Apply Config</button>
-        <button type="button" class="btn btn-green"   onclick="testHealth()">🩺 Test Health</button>
-        <button type="button" class="btn btn-red"     onclick="testDispatch()">🚁 Dispatch Drone Now (Test)</button>
-        <button type="button" class="btn" style="background:#2d3748;color:#a0aec0" onclick="loadLogs()">📋 Refresh Logs</button>
+      <div class="field">
+        <label>Auth Type in Scylla</label>
+        <div class="url-box">Bearer Token → use your Push Token above</div>
       </div>
-    </form>
+      <div class="field">
+        <label>Health Check</label>
+        <div class="url-box" id="healthUrl">Loading...</div>
+      </div>
+      <div class="field">
+        <label>Logs</label>
+        <div class="url-box" id="logsUrl">Loading...</div>
+      </div>
+    </div>
   </div>
 
-  <!-- Live Logs -->
+  <!-- LIVE LOGS -->
   <div class="card">
-    <h2>📋 Live Activity Log <span style="font-size:12px;font-weight:400;color:#718096">(last 50 events)</span></h2>
-    <div class="log-box" id="logBox">Loading logs...</div>
+    <h2>📋 Live Logs <span class="badge">Last 100 events</span></h2>
+    <div class="log-box" id="logBox">Loading...</div>
   </div>
 
 </div>
 
 <script>
-async function saveConfig() {
-  const fields = ['SCYLLA_PUSH_TOKEN','DJI_X_USER_TOKEN','DJI_X_PROJECT_UUID',
-                  'DJI_WORKFLOW_UUID','DJI_CREATOR_ID','DJI_FH2_ENDPOINT',
-                  'AUTO_TRIGGER_LEVEL','DEFAULT_LATITUDE','DEFAULT_LONGITUDE','ADMIN_PASSWORD'];
-  const body = { adminPassword: document.getElementById('adminPassword').value };
-  fields.forEach(f => { body[f] = document.getElementById(f).value; });
-  try {
-    const r = await fetch('/admin/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const d = await r.json();
-    showMsg(r.ok ? 'ok' : 'err', r.ok ? '✅ Config saved! Updated: ' + d.updated.join(', ') : '❌ ' + (d.error || 'Error'));
-    if (r.ok) setTimeout(() => location.reload(), 1500);
-  } catch(e) { showMsg('err', '❌ Network error: ' + e.message); }
-}
-async function testHealth() {
-  try {
-    const r = await fetch('/health');
-    const d = await r.json();
-    const all = Object.values(d.configured).every(Boolean);
-    showMsg(all ? 'ok' : 'err', all ? '✅ Bridge healthy! All tokens configured.' : '⚠️ Bridge running but some tokens missing: ' + JSON.stringify(d.configured));
-  } catch(e) { showMsg('err', '❌ ' + e.message); }
-}
-async function testDispatch() {
-  const lat = ${cfg.DEFAULT_LATITUDE};
-  const lng = ${cfg.DEFAULT_LONGITUDE};
-  try {
-    const r = await fetch('/test/trigger', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({latitude:lat,longitude:lng,level:5,description:'Admin panel test dispatch'}) });
-    const d = await r.json();
-    showMsg(r.ok ? 'ok' : 'err', r.ok ? '🚁 Dispatch sent! DJI response: ' + JSON.stringify(d.djiResponse) : '❌ ' + JSON.stringify(d));
-  } catch(e) { showMsg('err', '❌ ' + e.message); }
-}
-async function loadLogs() {
-  try {
-    const r = await fetch('/logs');
-    const d = await r.json();
-    const box = document.getElementById('logBox');
-    if (!d.logs.length) { box.innerHTML = '<span style="color:#718096">No activity yet</span>'; return; }
-    box.innerHTML = d.logs.map(l =>
-      '<div class="log-entry"><span class="time">' + l.time.replace('T',' ').slice(0,19) + '</span> ' +
-      '<span class="type-' + l.type + '">[' + l.type + ']</span> ' + l.msg + '</div>'
-    ).join('');
-  } catch(e) {}
-}
-function showMsg(type, text) {
+const BASE = window.location.origin;
+document.getElementById('webhookUrl').textContent = BASE + '/webhook/scylla';
+document.getElementById('healthUrl').textContent  = BASE + '/health';
+document.getElementById('logsUrl').textContent    = BASE + '/logs';
+
+function showMsg(text, isOk) {
   const el = document.getElementById('msg');
-  el.className = type; el.textContent = text; el.style.display = 'block';
-  setTimeout(() => el.style.display = 'none', 6000);
+  el.textContent = text;
+  el.className = isOk ? 'ok' : 'err';
+  setTimeout(() => el.className = '', 8000);
 }
+
+async function saveConfig() {
+  const password = document.getElementById('currentPassword').value;
+  if (!password) { showMsg('❌ Enter current admin password first', false); return; }
+  const fields = ['ADMIN_PASSWORD','DJI_FH2_ENDPOINT','DJI_FH2_PATH','DJI_X_USER_TOKEN',
+    'DJI_X_PROJECT_UUID','DJI_WORKFLOW_UUID','DJI_CREATOR_ID','SCYLLA_PUSH_TOKEN',
+    'SOURCE_PLATFORM','AUTO_TRIGGER_LEVEL','DEFAULT_LATITUDE','DEFAULT_LONGITUDE'];
+  const body = { password };
+  for (const f of fields) {
+    const el = document.getElementById(f);
+    if (el && el.value) body[f] = el.value;
+  }
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (d.success) {
+      showMsg('✅ Configuration saved! Bridge is ' + (d.configured ? 'READY' : 'still needs more fields'), true);
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      showMsg('❌ ' + (d.error || 'Save failed'), false);
+    }
+  } catch(e) { showMsg('❌ Error: ' + e.message, false); }
+}
+
+async function testDJI() {
+  const password = document.getElementById('currentPassword').value;
+  if (!password) { showMsg('❌ Enter admin password first', false); return; }
+  showMsg('🔄 Testing DJI connection...', true);
+  try {
+    const r = await fetch('/api/test-dji', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    });
+    const d = await r.json();
+    if (d.success) {
+      showMsg('✅ DJI Connection OK! Response code: ' + d.djiResponse?.code + ' — Drone dispatched!', true);
+    } else {
+      showMsg('❌ DJI Error: ' + JSON.stringify(d.data || d.error), false);
+    }
+  } catch(e) { showMsg('❌ ' + e.message, false); }
+}
+
+async function testWebhook() {
+  const password = document.getElementById('currentPassword').value;
+  if (!password) { showMsg('❌ Enter admin password first', false); return; }
+  showMsg('🔄 Sending test alert through full pipeline...', true);
+  try {
+    const r = await fetch('/api/test-webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    });
+    const d = await r.json();
+    if (d.success && d.result?.djiResponse?.code === 0) {
+      showMsg('✅ Full pipeline OK! Alert → Bridge → DJI → Drone dispatched! UUID: ' + d.result.djiResponse?.data?.uuid, true);
+    } else {
+      showMsg('❌ Pipeline error: ' + JSON.stringify(d.result?.djiResponse || d.error || d), false);
+    }
+  } catch(e) { showMsg('❌ ' + e.message, false); }
+}
+
+function loadLogs() {
+  fetch('/logs').then(r => r.json()).then(d => {
+    const box = document.getElementById('logBox');
+    if (!d.logs || !d.logs.length) { box.innerHTML = '<span style="color:#718096">No logs yet</span>'; return; }
+    box.innerHTML = d.logs.map(l => {
+      const t    = new Date(l.time).toLocaleTimeString();
+      const data = l.data ? ' — ' + JSON.stringify(l.data).slice(0,120) : '';
+      return \`<div class="log-\${l.type}">[\${t}] [\${l.type}] \${l.msg}\${data}</div>\`;
+    }).join('');
+  });
+}
+
+// Auto-color fields
+document.querySelectorAll('input[type=text], input[type=password]').forEach(el => {
+  el.addEventListener('input', () => {
+    el.className = el.value ? 'filled' : 'empty';
+  });
+});
+
 loadLogs();
 setInterval(loadLogs, 8000);
 </script>
@@ -431,88 +621,29 @@ setInterval(loadLogs, 8000);
 </html>`);
 });
 
-// ── Start ────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log('\n╔══════════════════════════════════════════════════╗');
-  console.log('║   Scylla.ai  →  DJI FlightHub 2  Bridge  v1.1   ║');
-  console.log('╚══════════════════════════════════════════════════╝');
-  console.log(`🚀 Running on port: ${PORT}`);
-  console.log(`🔧 Admin panel   : http://localhost:${PORT}/admin`);
-  console.log(`📡 Webhook       : POST http://localhost:${PORT}/webhook/scylla`);
-  console.log(`🩺 Health        : GET  http://localhost:${PORT}/health\n`);
-});
-
-
-// ── Keep-Alive: Self-ping every 14 min to prevent Render free-tier sleep ──
+// ── Keep-Alive ────────────────────────────────────────────────────────────────
 (function startKeepAlive() {
-  const SELF_URL = process.env.RENDER_EXTERNAL_URL || ('http://localhost:' + PORT);
-  const INTERVAL = 14 * 60 * 1000; // 14 minutes
-
+  const INTERVAL = 14 * 60 * 1000;
   function ping() {
-    const mod = SELF_URL.startsWith('https') ? require('https') : require('http');
-    mod.get(SELF_URL + '/health', (r) => {
-      console.log('[keep-alive] ✅ ping OK ' + new Date().toISOString() + ' (' + r.statusCode + ')');
-    }).on('error', (e) => {
-      console.log('[keep-alive] ⚠️  ping fail: ' + e.message);
-    });
+    const SELF = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const mod  = SELF.startsWith('https') ? require('https') : require('http');
+    mod.get(`${SELF}/health`, r => {
+      console.log(`[keep-alive] ✅ ${new Date().toISOString()} (${r.statusCode})`);
+    }).on('error', e => console.log(`[keep-alive] ⚠️ ${e.message}`));
   }
-
-  // First ping after 3-min warm-up, then every 14 min
-  setTimeout(() => {
-    ping();
-    setInterval(ping, INTERVAL);
-    console.log('[keep-alive] 🔄 Keep-alive active — pinging ' + SELF_URL + '/health every 14 min');
-  }, 3 * 60 * 1000);
+  setTimeout(() => { ping(); setInterval(ping, INTERVAL); }, 3 * 60 * 1000);
 })();
 
-module.exports = app;
-
-// ── DIAGNOSTIC: Query DJI FH2 to find correct workflow + project UUIDs ──────
-app.get('/diagnostic', async (req, res) => {
-  const axios = require('axios');
-  const token = cfg.DJI_X_USER_TOKEN;
-  const projUuid = cfg.DJI_X_PROJECT_UUID;
-  const base = cfg.DJI_FH2_ENDPOINT;
-
-  if (!token || token === 'YOUR_SECRET_TOKEN') {
-    return res.status(400).json({ error: 'DJI_X_USER_TOKEN not set. Please configure it in /admin first.' });
-  }
-
-  const report = { token_preview: token.slice(0,12)+'...', project_uuid_in_config: projUuid, results: {} };
-
-  // 1. List all projects in org
-  try {
-    const projResp = await axios.get(`${base}/openapi/v0.1/workspaces`, {
-      headers: { 'X-User-Token': token, 'Content-Type': 'application/json' },
-      timeout: 8000
-    });
-    report.results.projects = projResp.data;
-  } catch(e) {
-    report.results.projects_error = { status: e.response?.status, data: e.response?.data, msg: e.message };
-  }
-
-  // 2. List workflows in the configured project
-  try {
-    const wfResp = await axios.get(`${base}/openapi/v0.1/workflows`, {
-      headers: { 'X-User-Token': token, 'x-project-uuid': projUuid, 'Content-Type': 'application/json' },
-      timeout: 8000
-    });
-    report.results.workflows_in_project = wfResp.data;
-  } catch(e) {
-    report.results.workflows_error = { status: e.response?.status, data: e.response?.data, msg: e.message };
-  }
-
-  // 3. Try triggered workflow list
-  try {
-    const trigResp = await axios.get(`${base}/openapi/v0.1/workflows?type=triggered`, {
-      headers: { 'X-User-Token': token, 'x-project-uuid': projUuid, 'Content-Type': 'application/json' },
-      timeout: 8000
-    });
-    report.results.triggered_workflows = trigResp.data;
-  } catch(e) {
-    report.results.triggered_workflows_error = { status: e.response?.status, data: e.response?.data, msg: e.message };
-  }
-
-  addLog('CFG', 'Diagnostic ran', null);
-  return res.json(report);
+// ── Start ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log('\n╔══════════════════════════════════════════════════╗');
+  console.log('║  Universal DJI FlightHub 2 Bridge  v2.0          ║');
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log(`🚀 Port     : ${PORT}`);
+  console.log(`🔧 Admin    : http://localhost:${PORT}/admin`);
+  console.log(`📡 Webhook  : POST http://localhost:${PORT}/webhook/scylla`);
+  console.log(`🩺 Health   : GET  http://localhost:${PORT}/health`);
+  console.log(`📋 Config   : ${fs.existsSync(CFG_FILE) ? '✅ config.json found' : '⚠️  No config yet — open /admin to setup'}\n`);
 });
+
+module.exports = app;
